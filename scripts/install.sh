@@ -12,4 +12,5 @@ python3 -m pip install --user --break-system-packages websockify vncdotool
 #     https://cdn.playwright.dev/builds/cft/<ver>/linux64/chrome-linux64.zip
 #   unzip, move to ~/.cache/ms-playwright/chromium-<ver>/chrome-linux/
 # noVNC static files: apt install novnc if you want them, or copy from anywhere
+# Agent control (agent/mb) needs nothing extra: python3 stdlib only.
 echo "musebrowser deps installed."

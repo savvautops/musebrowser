@@ -52,3 +52,19 @@ curl -s -o /dev/null -w "%{http_code}\n" https://musebrowser.example.com/
 # 302 -> Access login   (good: gate is working)
 # 200                   (only after logging in through Access)
 ```
+
+## 5. Agent API ingress (optional)
+
+The agent API (`agent/mb serve`, `127.0.0.1:9280`) is localhost-only. If
+musebrowser runs on a box the agent can't reach directly, add a second
+ingress on the same tunnel behind the same Access gate:
+
+```bash
+cf-tunnel ingress $TID api.musebrowser.example.com http://127.0.0.1:9280
+cf-tunnel dns <zone-name> api.musebrowser.example.com $TID
+# then add api.musebrowser.example.com to the Access app (or a second app)
+```
+
+Set `MB_TOKEN` on the box before `start.sh` so `/api/*` requires
+`Authorization: Bearer <token>` — whoever reaches the API inherits the
+browser profile's sessions, so treat the token like a password.

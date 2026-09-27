@@ -1,0 +1,377 @@
+#!/usr/bin/env python3
+"""mb — drive musebrowser like an agent.
+
+Same Chromium, same persistent profile as the noVNC desktop: the human drives
+via https://musebrowser.nano-nodes.com, the agent drives via this CLI (or the
+built-in HTTP API: `mb serve`). Our hands.
+
+  mb tabs
+  mb goto <url> [--tab N]
+  mb newtab [url] | mb closetab <N>
+  mb back | mb forward | mb reload [--tab N]
+  mb shot [path] [--full] [--tab N]
+  mb text [--tab N]
+  mb click <selector> [--tab N]
+  mb fill <selector> <text> [--tab N]
+  mb type <selector> <text> [--tab N]
+  mb press <key> [--tab N]        (Enter, Tab, Escape, Backspace, arrows, or a char)
+  mb eval <js> [--tab N]
+  mb wait <selector> [--timeout SEC] [--tab N]
+  mb serve [--port 9280]          (HTTP API on 127.0.0.1 only)
+
+Env: MB_HOST / MB_PORT (DevTools, default 127.0.0.1:9222),
+     MB_TOKEN (serve mode: require `Authorization: Bearer <token>`).
+Stdlib only — no third-party dependencies.
+"""
+
+import argparse
+import base64
+import json
+import os
+import sys
+import time
+
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+from cdp import CDPError, connect_browser, connect_page, list_targets  # noqa: E402
+
+HOST = os.environ.get("MB_HOST", "127.0.0.1")
+PORT = int(os.environ.get("MB_PORT", "9222"))
+
+JS_CLICK = """(sel) => {
+  const el = document.querySelector(sel);
+  if (!el) return 'NOTFOUND';
+  el.scrollIntoView({block: 'center', inline: 'center'});
+  el.click();
+  return 'OK ' + el.tagName + (el.id ? '#' + el.id : '');
+}"""
+
+JS_FILL = """(sel, text) => {
+  const el = document.querySelector(sel);
+  if (!el) return 'NOTFOUND';
+  el.focus();
+  if (!('value' in el) && !el.isContentEditable) return 'NOTFILLABLE';
+  if (el.isContentEditable) { el.textContent = text; }
+  else { el.value = text; }
+  el.dispatchEvent(new Event('input', {bubbles: true}));
+  el.dispatchEvent(new Event('change', {bubbles: true}));
+  return 'OK ' + el.tagName;
+}"""
+
+JS_FOCUS = """(sel) => {
+  const el = document.querySelector(sel);
+  if (!el) return 'NOTFOUND';
+  el.focus();
+  return 'OK';
+}"""
+
+JS_EXISTS = "(sel) => !!document.querySelector(sel)"
+
+KEYS = {
+    "Enter": (13, "Enter", "Enter", "\r"),
+    "Tab": (9, "Tab", "Tab", None),
+    "Escape": (27, "Escape", "Escape", None),
+    "Backspace": (8, "Backspace", "Backspace", None),
+    "ArrowLeft": (37, "ArrowLeft", "ArrowLeft", None),
+    "ArrowRight": (39, "ArrowRight", "ArrowRight", None),
+    "ArrowUp": (38, "ArrowUp", "ArrowUp", None),
+    "ArrowDown": (40, "ArrowDown", "ArrowDown", None),
+}
+
+
+def _eval(s, expression, timeout=30):
+    r = s.call("Runtime.evaluate", {
+        "expression": expression,
+        "returnByValue": True,
+        "awaitPromise": True,
+    }, timeout=timeout)
+    res = r.get("result", {})
+    if res.get("subtype") == "error" or "exceptionDetails" in r:
+        raise CDPError(f"page JS error: {res.get('description', r)}")
+    return res.get("value")
+
+
+def _wait_ready(s, timeout=20):
+    end = time.time() + timeout
+    while time.time() < end:
+        try:
+            if _eval(s, "document.readyState", timeout=10) == "complete":
+                return True
+        except CDPError:
+            pass
+        time.sleep(0.5)
+    return False
+
+
+def _page_targets():
+    return [t for t in list_targets(HOST, PORT) if t.get("type") == "page"]
+
+
+# ------------------------------------------------------------------ ops
+
+def op_tabs(**kw):
+    return [{"index": i, "id": t["id"][:12], "title": t.get("title"),
+             "url": t.get("url")} for i, t in enumerate(_page_targets())]
+
+
+def op_goto(url, tab=0, timeout=30, **kw):
+    s, _ = connect_page(HOST, PORT, index=tab)
+    try:
+        s.call("Page.navigate", {"url": url}, timeout=timeout)
+        loaded = _wait_ready(s, timeout=timeout)
+        return {"url": url, "loaded": loaded}
+    finally:
+        s.close()
+
+
+def op_newtab(url="about:blank", **kw):
+    s = connect_browser(HOST, PORT)
+    try:
+        r = s.call("Target.createTarget", {"url": url})
+        return {"targetId": r.get("targetId"), "url": url,
+                "tab": len(_page_targets()) - 1}
+    finally:
+        s.close()
+
+
+def op_closetab(tab=0, **kw):
+    targets = _page_targets()
+    if tab < 0 or tab >= len(targets):
+        raise CDPError(f"tab index {tab} out of range")
+    s = connect_browser(HOST, PORT)
+    try:
+        s.call("Target.closeTarget", {"targetId": targets[tab]["id"]})
+        return {"closed": tab}
+    finally:
+        s.close()
+
+
+def _history(js, tab=0, timeout=20, **kw):
+    s, _ = connect_page(HOST, PORT, index=tab)
+    try:
+        _eval(s, js)
+        return {"loaded": _wait_ready(s, timeout=timeout)}
+    finally:
+        s.close()
+
+
+def op_back(**kw):
+    return _history("history.back()", **kw)
+
+
+def op_forward(**kw):
+    return _history("history.forward()", **kw)
+
+
+def op_reload(tab=0, timeout=20, **kw):
+    s, _ = connect_page(HOST, PORT, index=tab)
+    try:
+        s.call("Page.reload", timeout=timeout)
+        return {"loaded": _wait_ready(s, timeout=timeout)}
+    finally:
+        s.close()
+
+
+def op_shot(path=None, full=False, tab=0, **kw):
+    s, _ = connect_page(HOST, PORT, index=tab)
+    try:
+        r = s.call("Page.captureScreenshot",
+                   {"format": "png", "captureBeyondViewport": bool(full)})
+        data = base64.b64decode(r["data"])
+        if not path:
+            path = f"/tmp/mb-shot-{int(time.time())}.png"
+        with open(path, "wb") as f:
+            f.write(data)
+        return {"path": path, "bytes": len(data)}
+    finally:
+        s.close()
+
+
+def op_text(tab=0, **kw):
+    s, _ = connect_page(HOST, PORT, index=tab)
+    try:
+        return {"text": _eval(s, "document.documentElement.innerText")}
+    finally:
+        s.close()
+
+
+def op_click(selector, tab=0, **kw):
+    s, _ = connect_page(HOST, PORT, index=tab)
+    try:
+        expr = f"({JS_CLICK})({json.dumps(selector)})"
+        return {"result": _eval(s, expr)}
+    finally:
+        s.close()
+
+
+def op_fill(selector, text, tab=0, **kw):
+    s, _ = connect_page(HOST, PORT, index=tab)
+    try:
+        expr = f"({JS_FILL})({json.dumps(selector)}, {json.dumps(text)})"
+        return {"result": _eval(s, expr)}
+    finally:
+        s.close()
+
+
+def op_type(selector, text, tab=0, **kw):
+    s, _ = connect_page(HOST, PORT, index=tab)
+    try:
+        found = _eval(s, f"({JS_FOCUS})({json.dumps(selector)})")
+        if found == "NOTFOUND":
+            return {"result": "NOTFOUND"}
+        s.call("Input.insertText", {"text": text})
+        return {"result": "OK typed %d chars" % len(text)}
+    finally:
+        s.close()
+
+
+def op_press(key, tab=0, **kw):
+    s, _ = connect_page(HOST, PORT, index=tab)
+    try:
+        if len(key) == 1:
+            s.call("Input.dispatchKeyEvent", {"type": "char", "text": key})
+            return {"result": f"OK char {key!r}"}
+        if key not in KEYS:
+            raise CDPError(f"unknown key {key!r} (try Enter/Tab/Escape/Backspace/arrows or a single char)")
+        code, k, c, text = KEYS[key]
+        down = {"type": "rawKeyDown", "windowsVirtualKeyCode": code,
+                "key": k, "code": c}
+        if text:
+            down["text"] = text
+        s.call("Input.dispatchKeyEvent", down)
+        s.call("Input.dispatchKeyEvent",
+               {"type": "keyUp", "windowsVirtualKeyCode": code,
+                "key": k, "code": c})
+        return {"result": f"OK {key}"}
+    finally:
+        s.close()
+
+
+def op_eval(js, tab=0, **kw):
+    s, _ = connect_page(HOST, PORT, index=tab)
+    try:
+        return {"value": _eval(s, js)}
+    finally:
+        s.close()
+
+
+def op_wait(selector, timeout=15, tab=0, **kw):
+    s, _ = connect_page(HOST, PORT, index=tab)
+    try:
+        end = time.time() + float(timeout)
+        while time.time() < end:
+            if _eval(s, f"({JS_EXISTS})({json.dumps(selector)})", timeout=10):
+                return {"found": True, "selector": selector}
+            time.sleep(0.4)
+        return {"found": False, "selector": selector}
+    finally:
+        s.close()
+
+
+OPS = {
+    "tabs": op_tabs, "goto": op_goto, "newtab": op_newtab,
+    "closetab": op_closetab, "back": op_back, "forward": op_forward,
+    "reload": op_reload, "shot": op_shot, "text": op_text,
+    "click": op_click, "fill": op_fill, "type": op_type,
+    "press": op_press, "eval": op_eval, "wait": op_wait,
+}
+
+
+# ----------------------------------------------------------------- serve
+
+def run_server(port):
+    from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+
+    token = os.environ.get("MB_TOKEN", "")
+
+    class Handler(BaseHTTPRequestHandler):
+        def log_message(self, fmt, *args):
+            sys.stderr.write("mb serve: " + fmt % args + "\n")
+
+        def _send(self, obj, code=200):
+            body = json.dumps(obj).encode()
+            self.send_response(code)
+            self.send_header("Content-Type", "application/json")
+            self.send_header("Content-Length", str(len(body)))
+            self.end_headers()
+            self.wfile.write(body)
+
+        def do_GET(self):
+            if self.path == "/healthz":
+                self._send({"ok": True, "service": "musebrowser-agent"})
+            else:
+                self._send({"ok": False, "error": "not found"}, 404)
+
+        def do_POST(self):
+            if token and self.headers.get("Authorization", "") != f"Bearer {token}":
+                self._send({"ok": False, "error": "unauthorized"}, 401)
+                return
+            parts = self.path.strip("/").split("/")
+            if len(parts) != 2 or parts[0] != "api" or parts[1] not in OPS:
+                self._send({"ok": False, "error": "unknown op"}, 404)
+                return
+            try:
+                length = int(self.headers.get("Content-Length", 0))
+                params = json.loads(self.rfile.read(length) or b"{}")
+                if not isinstance(params, dict):
+                    raise ValueError("body must be a JSON object")
+            except Exception as e:
+                self._send({"ok": False, "error": f"bad json: {e}"}, 400)
+                return
+            try:
+                result = OPS[parts[1]](**params)
+                self._send({"ok": True, "result": result})
+            except CDPError as e:
+                self._send({"ok": False, "error": str(e)}, 502)
+            except TypeError as e:
+                self._send({"ok": False, "error": f"bad params: {e}"}, 400)
+
+    ThreadingHTTPServer(("127.0.0.1", port), Handler).serve_forever()
+
+
+# ------------------------------------------------------------------- CLI
+
+def main(argv=None):
+    ap = argparse.ArgumentParser(prog="mb",
+                                 description="Drive musebrowser like an agent.")
+    ap.add_argument("--tab", type=int, default=0, help="tab index (default 0)")
+    sub = ap.add_subparsers(dest="op", required=True)
+
+    sub.add_parser("tabs")
+    p = sub.add_parser("goto"); p.add_argument("url")
+    p.add_argument("--timeout", type=float, default=30)
+    p = sub.add_parser("newtab"); p.add_argument("url", nargs="?", default="about:blank")
+    p = sub.add_parser("closetab"); p.add_argument("target", type=int)
+    sub.add_parser("back"); sub.add_parser("forward"); sub.add_parser("reload")
+    p = sub.add_parser("shot"); p.add_argument("path", nargs="?")
+    p.add_argument("--full", action="store_true")
+    sub.add_parser("text")
+    p = sub.add_parser("click"); p.add_argument("selector")
+    p = sub.add_parser("fill"); p.add_argument("selector"); p.add_argument("text")
+    p = sub.add_parser("type"); p.add_argument("selector"); p.add_argument("text")
+    p = sub.add_parser("press"); p.add_argument("key")
+    p = sub.add_parser("eval"); p.add_argument("js")
+    p = sub.add_parser("wait"); p.add_argument("selector")
+    p.add_argument("--timeout", type=float, default=15)
+    p = sub.add_parser("serve"); p.add_argument("--port", type=int, default=9280)
+
+    args = ap.parse_args(argv)
+    if args.op == "serve":
+        run_server(args.port)
+        return
+    # closetab takes its tab positionally; unify into params["tab"]
+    params = {"tab": args.tab}
+    if args.op == "closetab":
+        params["tab"] = args.target
+    for name in ("url", "selector", "text", "key", "js", "path", "full", "timeout"):
+        if hasattr(args, name):
+            params[name] = getattr(args, name)
+    try:
+        result = OPS[args.op](**params)
+        print(json.dumps({"ok": True, "result": result}, indent=2))
+    except CDPError as e:
+        print(json.dumps({"ok": False, "error": str(e)}))
+        sys.exit(1)
+
+
+if __name__ == "__main__":
+    main()
