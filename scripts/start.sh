@@ -89,6 +89,15 @@ if [ -z "$CHROMIUM_BIN" ]; then
   echo "  (then download the zip with curl --retry, the in-tool downloader stalls here)" >&2
   exit 1
 fi
+# --- local forward proxy for Chrome (adds egress Proxy-Authorization) ---
+# Chrome itself can't authenticate to the sandbox egress proxy, so a tiny
+# localhost-only forwarder on 18080 injects the credentials. Chrome gets
+# --proxy-server=http://127.0.0.1:18080 (set in agent/cdp-bridge).
+if ! _running "[l]ocal-proxy.py"; then
+  python3 "$BASE/agent/local-proxy.py" >/tmp/musebrowser-proxy.log 2>&1 &
+  sleep 1
+fi
+
 # --- chromium via cdp-bridge (NOT launched directly) ---
 # Headed Chrome-for-Testing never binds a TCP --remote-debugging-port, so the
 # bridge spawns chromium with --remote-debugging-pipe and serves the DevTools

@@ -73,6 +73,20 @@ class PipeCDP:
         # Now: fd 3 = chrome's CDP stdin, fd 4 = chrome's CDP stdout.
 
         logf = open(log_path, "ab")
+        # Trust the sandbox egress proxy's MITM CA so Chrome accepts the
+        # proxy's re-issued certificates. Without this every HTTPS site
+        # shows a privacy error. Uses the system CA bundle entry.
+        try:
+            ca = "/etc/ssl/certs/hatch-egress-ca.pem"
+            if os.path.exists(ca):
+                os.makedirs(profile, exist_ok=True)
+                subprocess.run(
+                    ["certutil", "-d", f"sql:{profile}", "-A",
+                     "-t", "C,,", "-n", "HatchEgressCA", "-i", ca],
+                    stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                    timeout=15)
+        except Exception:
+            pass
         self.proc = subprocess.Popen(
             [chrome_bin, "--remote-debugging-pipe",
              "--no-sandbox", "--disable-dev-shm-usage",
@@ -82,6 +96,17 @@ class PipeCDP:
              # launch flags). Side effect: an infobar notes the browser is
              # automated, and navigator.webdriver=true.
              "--enable-automation", "--no-first-run",
+             # Hide the automation flag from JS (navigator.webdriver) while
+             # keeping --enable-automation so the CDP pipe still answers.
+             # Reduces bot-detection on sites like Google.
+             "--disable-blink-features=AutomationControlled",
+             # Route through the localhost forward proxy (agent/local-proxy.py),
+             # which adds egress Proxy-Authorization. Bypass it for loopback.
+             "--proxy-server=http://127.0.0.1:18080",
+             "--proxy-bypass-list=localhost;127.0.0.1;[::1]",
+             # DIAGNOSTIC ONLY: Chrome-for-Testing ignores NSS trust stores.
+             # Remove once proper CA trust is confirmed working.
+             "--ignore-certificate-errors",
              f"--user-data-dir={profile}", f"--display={display}",
              f"--window-size={window_size}", "--start-maximized",
              "about:blank"],
