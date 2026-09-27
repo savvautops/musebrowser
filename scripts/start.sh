@@ -56,16 +56,21 @@ if ! running "websockify.*$WEB_PORT"; then
   sleep 1
 fi
 
-# --- chromium ---
-if ! running "chromium.*--user-data-dir=$PROFILE"; then
-  chromium --no-sandbox --disable-dev-shm-usage \
+# --- chromium (auto-detect: system chromium, else Playwright's bundled build) ---
+CHROMIUM_BIN="${CHROMIUM_BIN:-$(command -v chromium || command -v chromium-browser || ls -d ~/.cache/ms-playwright/chromium-*/chrome-linux/chrome 2>/dev/null | sort -V | tail -1)}"
+if [ -z "$CHROMIUM_BIN" ]; then
+  echo "ERROR: no chromium found. Run: python3 -m playwright install chromium" >&2
+  exit 1
+fi
+if ! running "chromium.*--user-data-dir=$PROFILE" && ! running "chrome.*--user-data-dir=$PROFILE"; then
+  "$CHROMIUM_BIN" --no-sandbox --disable-dev-shm-usage \
     --user-data-dir="$PROFILE" --display=$DISPLAY_NUM \
     --window-size=1280,800 --start-maximized \
     about:blank >/tmp/musebrowser-chromium.log 2>&1 &
 fi
 
 sleep 2
-echo "musebrowser stack:"
-pgrep -af "Xvfb $DISPLAY_NUM|x11vnc.*$VNC_PORT|websockify.*$WEB_PORT|chromium.*user-data-dir=$PROFILE" \
+echo "musebrowser stack ($CHROMIUM_BIN):"
+pgrep -af "[X]vfb $DISPLAY_NUM|[x]11vnc.*$VNC_PORT|[w]ebsockify.*$WEB_PORT|[c]hrom.*--user-data-dir=$PROFILE" \
   | sed 's/^/  /' || true
 curl -s -o /dev/null -w "noVNC web UI: HTTP %{http_code} on :$WEB_PORT\n" http://127.0.0.1:$WEB_PORT/
