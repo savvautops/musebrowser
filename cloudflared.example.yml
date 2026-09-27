@@ -1,0 +1,12 @@
+# cloudflared example config for musebrowser
+# Copy to ~/.cloudflared/config.yml and run: cloudflared tunnel --config ~/.cloudflared/config.yml run
+# (Needs a credentials file for the tunnel — from `cloudflared tunnel login`
+#  or the API-created tunnel's credentials JSON placed at the path below.)
+
+tunnel: <tunnel-id>
+credentials-file: /home/user/.cloudflared/<tunnel-id>.json
+
+ingress:
+  - hostname: musebrowser.example.com
+    service: http://127.0.0.1:6080
+  - service: http_status:404
