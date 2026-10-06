@@ -278,6 +278,51 @@ OPS = {
 
 # ----------------------------------------------------------------- serve
 
+# --- Cloudflare Access edge-JWT verification --------------------------------
+# Optional second auth path for /api/*: Cloudflare Access injects
+# Cf-Access-Jwt-Assertion on every request that passed the Access policy.
+# Enabled only when CF_ACCESS_AUD is set (fail closed otherwise).
+CF_ACCESS_TEAM_DOMAIN = os.environ.get(
+    "CF_ACCESS_TEAM_DOMAIN", "https://sockonconcrete.cloudflareaccess.com"
+).rstrip("/")
+CF_ACCESS_AUD = os.environ.get("CF_ACCESS_AUD", "").strip()
+_cf_jwks_client = None
+
+
+def _cf_access_jwt_valid(assertion):
+    global _cf_jwks_client
+    if not (CF_ACCESS_AUD and assertion):
+        return False
+    try:
+        import jwt  # PyJWT (python3-jwt + python3-cryptography)
+
+        if _cf_jwks_client is None:
+            _cf_jwks_client = jwt.PyJWKClient(
+                f"{CF_ACCESS_TEAM_DOMAIN}/cdn-cgi/access/certs", cache_keys=True
+            )
+        key = _cf_jwks_client.get_signing_key_from_jwt(assertion).key
+        jwt.decode(
+            assertion,
+            key,
+            algorithms=["RS256"],
+            audience=CF_ACCESS_AUD,
+            issuer=CF_ACCESS_TEAM_DOMAIN,
+            options={"require": ["exp", "iat", "aud", "iss"]},
+        )
+        return True
+    except Exception as e:  # noqa: BLE001 - any failure means unauthorized
+        print(f"cf-access jwt rejected: {type(e).__name__}", file=sys.stderr, flush=True)
+        return False
+
+
+def _api_authorized(headers, token):
+    import hmac
+
+    if hmac.compare_digest(headers.get("Authorization", ""), f"Bearer {token}"):
+        return True
+    return _cf_access_jwt_valid(headers.get("Cf-Access-Jwt-Assertion", ""))
+
+
 def run_server(port):
     from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
     from broker import Broker, BrokerError
@@ -376,8 +421,9 @@ def run_server(port):
                     self._send({"ok": False, "error": str(e)}, 409)
                 return
 
-            # Agent CDP / API endpoints: require MB_TOKEN auth
-            if token and self.headers.get("Authorization", "") != f"Bearer {token}":
+            # Agent CDP / API endpoints: require MB_TOKEN bearer OR a valid
+            # Cloudflare Access edge JWT (single-credential callers via CF Access).
+            if token and not _api_authorized(self.headers, token):
                 self._send({"ok": False, "error": "unauthorized"}, 401)
                 return
 
