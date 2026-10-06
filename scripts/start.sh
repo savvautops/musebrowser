@@ -24,6 +24,11 @@ AGENT_PORT="9280"
 
 export PATH="$HOME/.local/bin:$PATH"
 mkdir -p "$PROFILE" "$WEBROOT"
+# Clear stale Chromium singleton locks left by a previous container/host
+# (persistent profile volume). Only when no chromium is running.
+if ! pgrep -x chromium >/dev/null 2>&1; then
+  rm -f "$PROFILE/SingletonLock" "$PROFILE/SingletonCookie" "$PROFILE/SingletonSocket"
+fi
 
 # pgrep -f matches the invoking shell's own command line, so a naive check
 # could "see" this script's caller when the caller's command text contains
