@@ -280,8 +280,11 @@ OPS = {
 
 def run_server(port):
     from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+    from broker import Broker, BrokerError
 
     token = os.environ.get("MB_TOKEN", "")
+    state_file = os.environ.get("MB_STATE_FILE", "/opt/musebrowser/profile/broker_state.json")
+    broker = Broker(state_file=state_file)
 
     class Handler(BaseHTTPRequestHandler):
         def log_message(self, fmt, *args):
@@ -291,21 +294,99 @@ def run_server(port):
             body = json.dumps(obj).encode()
             self.send_response(code)
             self.send_header("Content-Type", "application/json")
+            self.send_header("Access-Control-Allow-Origin", "*")
+            self.send_header("Access-Control-Allow-Methods", "GET, POST, OPTIONS")
+            self.send_header("Access-Control-Allow-Headers", "Content-Type, Authorization, X-SAO-Browser")
             self.send_header("Content-Length", str(len(body)))
             self.end_headers()
             self.wfile.write(body)
 
+        def do_OPTIONS(self):
+            self.send_response(204)
+            self.send_header("Access-Control-Allow-Origin", "*")
+            self.send_header("Access-Control-Allow-Methods", "GET, POST, OPTIONS")
+            self.send_header("Access-Control-Allow-Headers", "Content-Type, Authorization, X-SAO-Browser")
+            self.end_headers()
+
         def do_GET(self):
-            if self.path == "/healthz":
+            path = self.path.split("?")[0].rstrip("/")
+            if path in ("/healthz", "/health"):
                 self._send({"ok": True, "service": "musebrowser-agent"})
+            elif path in ("/status", "/sao-control/status"):
+                self._send(broker.status())
             else:
                 self._send({"ok": False, "error": "not found"}, 404)
 
         def do_POST(self):
+            path = self.path.split("?")[0].rstrip("/")
+
+            # SAO Broker owner control endpoints (from overlay or admin)
+            if path in ("/owner/stop", "/sao-control/owner/stop", "/owner/resume", "/sao-control/owner/resume"):
+                pause = path.endswith("/stop")
+                try:
+                    res = broker.owner(pause)
+                    self._send(res)
+                except BrokerError as e:
+                    self._send({"ok": False, "error": str(e)}, 409)
+                return
+
+            if path in ("/owner/action", "/sao-control/owner/action"):
+                try:
+                    length = int(self.headers.get("Content-Length", 0))
+                    params = json.loads(self.rfile.read(length) or b"{}")
+                    act = params.get("input", {})
+                    if act.get("action") == "type":
+                        # focused element typing
+                        s, _ = connect_page(HOST, PORT, index=0)
+                        try:
+                            s.call("Input.insertText", {"text": act.get("text", "")})
+                        finally:
+                            s.close()
+                    elif act.get("action") == "key":
+                        op_press(key=act.get("text", "Enter"), tab=0)
+                    self._send({"ok": True})
+                except Exception as e:
+                    self._send({"ok": False, "error": str(e)}, 500)
+                return
+
+            # Broker lease acquire/release
+            if path in ("/acquire", "/sao-control/acquire"):
+                try:
+                    length = int(self.headers.get("Content-Length", 0))
+                    body = json.loads(self.rfile.read(length) or b"{}")
+                    caller = body.get("caller") or self.headers.get("Tailscale-User-Login") or "anonymous-agent"
+                    label = body.get("label") or caller
+                    req_id = body.get("requestId") or body.get("request_id") or "req-default"
+                    res = broker.acquire(caller, label, req_id)
+                    self._send(res)
+                except BrokerError as e:
+                    self._send({"ok": False, "error": str(e)}, 409)
+                return
+
+            if path in ("/release", "/sao-control/release"):
+                try:
+                    length = int(self.headers.get("Content-Length", 0))
+                    body = json.loads(self.rfile.read(length) or b"{}")
+                    caller = body.get("caller") or self.headers.get("Tailscale-User-Login") or "anonymous-agent"
+                    token_val = body.get("lease") or body.get("token")
+                    req_id = body.get("requestId") or body.get("request_id")
+                    res = broker.release(caller, token_val, req_id)
+                    self._send(res)
+                except BrokerError as e:
+                    self._send({"ok": False, "error": str(e)}, 409)
+                return
+
+            # Agent CDP / API endpoints: require MB_TOKEN auth
             if token and self.headers.get("Authorization", "") != f"Bearer {token}":
                 self._send({"ok": False, "error": "unauthorized"}, 401)
                 return
-            parts = self.path.strip("/").split("/")
+
+            # Check if broker is paused by owner
+            if broker.paused:
+                self._send({"ok": False, "error": "Browser paused by owner"}, 409)
+                return
+
+            parts = path.strip("/").split("/")
             if len(parts) != 2 or parts[0] != "api" or parts[1] not in OPS:
                 self._send({"ok": False, "error": "unknown op"}, 404)
                 return
@@ -317,9 +398,19 @@ def run_server(port):
             except Exception as e:
                 self._send({"ok": False, "error": f"bad json: {e}"}, 400)
                 return
+
+            op_name = parts[1]
             try:
-                result = OPS[parts[1]](**params)
-                self._send({"ok": True, "result": result})
+                broker.start_action(op_name=op_name)
+                try:
+                    result = OPS[op_name](**params)
+                    broker.finish_action(op_name=op_name, outcome="ok")
+                    self._send({"ok": True, "result": result})
+                except Exception as e:
+                    broker.finish_action(op_name=op_name, outcome="error")
+                    raise
+            except BrokerError as e:
+                self._send({"ok": False, "error": str(e)}, 409)
             except CDPError as e:
                 self._send({"ok": False, "error": str(e)}, 502)
             except TypeError as e:

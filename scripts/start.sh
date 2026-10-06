@@ -39,9 +39,17 @@ _pids() {
 }
 _running() { [ -n "$(_pids "$1")" ]; }
 
-# --- web root: noVNC files + auto-connect landing page ---
+# --- web root: noVNC files + auto-connect landing page + SAO overlay ---
 if [ ! -f "$WEBROOT/vnc.html" ] && [ -d "$NOVNC_SRC" ]; then
   cp -r "$NOVNC_SRC"/. "$WEBROOT"/ 2>/dev/null || true
+fi
+# Copy SAO overlay if present in repo
+if [ -f "$BASE/web/sao-overlay.js" ]; then
+  cp -f "$BASE/web/sao-overlay.js" "$WEBROOT/sao-overlay.js"
+fi
+# Inject SAO overlay script into vnc.html if not present
+if [ -f "$WEBROOT/vnc.html" ] && ! grep -q 'sao-overlay.js' "$WEBROOT/vnc.html"; then
+  sed -i 's#</head>#    <script src="sao-overlay.js"></script>\n</head>#' "$WEBROOT/vnc.html"
 fi
 cat > "$WEBROOT/index.html" <<'HTML'
 <!doctype html><html><head><meta charset="utf-8"><title>musebrowser</title>
@@ -60,12 +68,17 @@ if ! _running "[X]vnc $DISPLAY_NUM"; then
 fi
 export DISPLAY=$DISPLAY_NUM
 
-# --- websockify + noVNC on $WEB_PORT ---
+# --- websockify + noVNC on $WEB_PORT (with SAO control proxy) ---
 # Bind explicitly to 127.0.0.1: the public URL is served through the
 # Cloudflare tunnel, never by exposing websockify directly.
 if ! _running "[w]ebsockify.*$WEB_PORT"; then
-  websockify --web "$WEBROOT" 127.0.0.1:$WEB_PORT localhost:$VNC_PORT \
-    >/tmp/musebrowser-websockify.log 2>&1 &
+  if [ -x "$BASE/agent/websockify-sao" ]; then
+    "$BASE/agent/websockify-sao" --web "$WEBROOT" 127.0.0.1:$WEB_PORT localhost:$VNC_PORT \
+      >/tmp/musebrowser-websockify.log 2>&1 &
+  else
+    websockify --web "$WEBROOT" 127.0.0.1:$WEB_PORT localhost:$VNC_PORT \
+      >/tmp/musebrowser-websockify.log 2>&1 &
+  fi
   sleep 1
 fi
 
